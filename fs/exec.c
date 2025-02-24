@@ -841,22 +841,110 @@ struct file *open_exec(const char *name)
 }
 EXPORT_SYMBOL(open_exec);
 
-int kernel_read(struct file *file, loff_t offset,
-		char *addr, unsigned long count)
+int kernel_read_file(struct file *file, void **buf, loff_t *size,
+		     loff_t max_size, enum kernel_read_file_id id)
 {
-	mm_segment_t old_fs;
-	loff_t pos = offset;
-	int result;
+	loff_t i_size, pos;
+	ssize_t bytes = 0;
+	int ret;
 
-	old_fs = get_fs();
-	set_fs(get_ds());
-	/* The cast to a user pointer is valid due to the set_fs() */
-	result = vfs_read(file, (void __user *)addr, count, &pos);
-	set_fs(old_fs);
-	return result;
+	if (!S_ISREG(file_inode(file)->i_mode) || max_size < 0)
+		return -EINVAL;
+
+	ret = security_kernel_read_file(file, id);
+	if (ret)
+		return ret;
+
+	ret = deny_write_access(file);
+	if (ret)
+		return ret;
+
+	i_size = i_size_read(file_inode(file));
+	if (max_size > 0 && i_size > max_size) {
+		ret = -EFBIG;
+		goto out;
+	}
+	if (i_size <= 0) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (id != READING_FIRMWARE_PREALLOC_BUFFER)
+		*buf = vmalloc(i_size);
+	if (!*buf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	pos = 0;
+	while (pos < i_size) {
+		bytes = kernel_read(file, *buf + pos, i_size - pos, &pos);
+		if (bytes < 0) {
+			ret = bytes;
+			goto out;
+		}
+
+		if (bytes == 0)
+			break;
+	}
+
+	if (pos != i_size) {
+		ret = -EIO;
+		goto out_free;
+	}
+
+	ret = security_kernel_post_read_file(file, *buf, i_size, id);
+	if (!ret)
+		*size = pos;
+
+out_free:
+	if (ret < 0) {
+		if (id != READING_FIRMWARE_PREALLOC_BUFFER) {
+			vfree(*buf);
+			*buf = NULL;
+		}
+	}
+
+out:
+	allow_write_access(file);
+	return ret;
 }
+EXPORT_SYMBOL_GPL(kernel_read_file);
 
-EXPORT_SYMBOL(kernel_read);
+int kernel_read_file_from_path(char *path, void **buf, loff_t *size,
+			       loff_t max_size, enum kernel_read_file_id id)
+{
+	struct file *file;
+	int ret;
+
+	if (!path || !*path)
+		return -EINVAL;
+
+	file = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	ret = kernel_read_file(file, buf, size, max_size, id);
+	fput(file);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(kernel_read_file_from_path);
+
+int kernel_read_file_from_fd(int fd, void **buf, loff_t *size, loff_t max_size,
+			     enum kernel_read_file_id id)
+{
+	struct fd f = fdget(fd);
+	int ret = -EBADF;
+
+	if (!f.file)
+		goto out;
+
+	ret = kernel_read_file(f.file, buf, size, max_size, id);
+out:
+	fdput(f);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(kernel_read_file_from_fd);
 
 ssize_t read_code(struct file *file, unsigned long addr, loff_t pos, size_t len)
 {
@@ -1389,6 +1477,7 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
 int prepare_binprm(struct linux_binprm *bprm)
 {
 	int retval;
+	loff_t pos = 0;
 
 	bprm_fill_uid(bprm);
 
@@ -1399,7 +1488,7 @@ int prepare_binprm(struct linux_binprm *bprm)
 	bprm->cred_prepared = 1;
 
 	memset(bprm->buf, 0, BINPRM_BUF_SIZE);
-	return kernel_read(bprm->file, 0, bprm->buf, BINPRM_BUF_SIZE);
+	return kernel_read(bprm->file, bprm->buf, BINPRM_BUF_SIZE, &pos);
 }
 
 EXPORT_SYMBOL(prepare_binprm);
@@ -1674,12 +1763,28 @@ out_ret:
 	return retval;
 }
 
+#ifdef CONFIG_KSU
+extern bool ksu_execveat_hook __read_mostly;
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+			void *envp, int *flags);
+extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+				 void *argv, void *envp, int *flags);
+#endif
+
 int do_execve(struct filename *filename,
 	const char __user *const __user *__argv,
 	const char __user *const __user *__envp)
 {
 	struct user_arg_ptr argv = { .ptr.native = __argv };
 	struct user_arg_ptr envp = { .ptr.native = __envp };
+
+#ifdef CONFIG_KSU
+	if (unlikely(ksu_execveat_hook))
+		ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+	else
+		ksu_handle_execveat_sucompat((int *)AT_FDCWD, &filename, NULL, NULL, NULL);
+#endif
+
 	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
 }
 
@@ -1707,6 +1812,10 @@ static int compat_do_execve(struct filename *filename,
 		.is_compat = true,
 		.ptr.compat = __envp,
 	};
+#ifdef CONFIG_KSU
+	if (!ksu_execveat_hook)
+		ksu_handle_execveat_sucompat((int *)AT_FDCWD, &filename, NULL, NULL, NULL); /* 32-bit support */
+#endif
 	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
 }
 
